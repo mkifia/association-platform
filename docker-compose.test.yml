@@ -1,0 +1,55 @@
+# Integration Testing Docker Compose
+# This file is used for running integration tests across all services
+
+
+services:
+  # Use lightweight test databases
+  postgres-test:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: association_platform_test
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: test_password
+    tmpfs:
+      - /var/lib/postgresql/data
+    networks:
+      - test-network
+
+  redis-test:
+    image: redis:7-alpine
+    command: redis-server --save ""
+    tmpfs:
+      - /data
+    networks:
+      - test-network
+
+  # Test services with minimal resources
+  platform-api-test:
+    build: ./association-platform-backend-apis/platform-api
+    environment:
+      - APP_ENV=test
+      - DATABASE_URL=postgresql://postgres:test_password@postgres-test:5432/association_platform_test
+      - REDIS_URL=redis://redis-test:6379
+    depends_on:
+      - postgres-test
+      - redis-test
+    networks:
+      - test-network
+
+  platform-bff-test:
+    build: ./association-platform-bff-services/platform-bff
+    environment:
+      - NODE_ENV=test
+      - PLATFORM_API_URL=http://platform-api-test/api
+      - REDIS_URL=redis://redis-test:6379
+    depends_on:
+      - platform-api-test
+      - redis-test
+    networks:
+      - test-network
+
+networks:
+  test-network:
+    driver: bridge
+
+volumes: {}
