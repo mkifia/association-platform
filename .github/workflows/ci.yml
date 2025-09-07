@@ -1,0 +1,326 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ==================== TESTS ====================
+  test:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    strategy:
+      matrix:
+        service: [operator-api, platform-api, member-api]
+        php-version: ['8.2']
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php-version }}
+          extensions: pdo, pdo_pgsql, intl, zip, curl
+          coverage: xdebug
+
+      - name: Cache Composer packages
+        id: composer-cache
+        uses: actions/cache@v3
+        with:
+          path: services/${{ matrix.service }}/vendor
+          key: ${{ runner.os }}-php-${{ matrix.php-version }}-${{ hashFiles('services/' + matrix.service + '/composer.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-php-${{ matrix.php-version }}-
+
+      - name: Install dependencies
+        working-directory: services/${{ matrix.service }}
+        run: composer install --prefer-dist --no-progress --no-dev --optimize-autoloader
+
+      - name: Create JWT keypair
+        working-directory: services/${{ matrix.service }}
+        run: |
+          mkdir -p config/jwt
+          openssl genpkey -algorithm RSA -out config/jwt/private.pem -pkcs8
+          openssl pkey -in config/jwt/private.pem -pubout -out config/jwt/public.pem
+          chmod 644 config/jwt/private.pem config/jwt/public.pem
+
+      - name: Setup test environment
+        working-directory: services/${{ matrix.service }}
+        run: |
+          cp .env.test .env.test.local
+          php bin/console doctrine:database:create --env=test
+          php bin/console doctrine:schema:create --env=test
+
+      - name: Run tests
+        working-directory: services/${{ matrix.service }}
+        run: |
+          vendor/bin/phpunit --coverage-clover=coverage.xml
+
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v3
+        with:
+          file: services/${{ matrix.service }}/coverage.xml
+          flags: ${{ matrix.service }}
+          name: ${{ matrix.service }}-coverage
+
+  # ==================== CODE QUALITY ====================
+  quality:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        service: [operator-api, platform-api, member-api]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: pdo, pdo_pgsql, intl, zip
+
+      - name: Install dependencies
+        working-directory: services/${{ matrix.service }}
+        run: composer install --prefer-dist --no-progress
+
+      - name: Run PHP CS Fixer
+        working-directory: services/${{ matrix.service }}
+        run: vendor/bin/php-cs-fixer fix --dry-run --diff --verbose
+
+      - name: Run PHPStan
+        working-directory: services/${{ matrix.service }}
+        run: vendor/bin/phpstan analyse src tests --level=6
+
+  # ==================== FRONTEND TESTS ====================
+  frontend-test:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        app: [operator-web, platform-web, member-web]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: web/${{ matrix.app }}/package-lock.json
+
+      - name: Install dependencies
+        working-directory: web/${{ matrix.app }}
+        run: npm ci
+
+      - name: Run ESLint
+        working-directory: web/${{ matrix.app }}
+        run: npm run lint
+
+      - name: Run tests
+        working-directory: web/${{ matrix.app }}
+        run: npm run test
+
+      - name: Build application
+        working-directory: web/${{ matrix.app }}
+        run: npm run build
+
+  # ==================== BFF TESTS ====================
+  bff-test:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        bff: [operator-bff, platform-bff, member-bff]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: bff/${{ matrix.bff }}/package-lock.json
+
+      - name: Install dependencies
+        working-directory: bff/${{ matrix.bff }}
+        run: npm ci
+
+      - name: Run ESLint
+        working-directory: bff/${{ matrix.bff }}
+        run: npm run lint
+
+      - name: Run tests
+        working-directory: bff/${{ matrix.bff }}
+        run: npm run test
+
+      - name: Build application
+        working-directory: bff/${{ matrix.bff }}
+        run: npm run build
+
+  # ==================== SECURITY SCAN ====================
+  security:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # ==================== BUILD & PUSH IMAGES ====================
+  build:
+    needs: [test, quality, frontend-test, bff-test]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    
+    strategy:
+      matrix:
+        service: 
+          - { name: operator-api, path: services/operator-api }
+          - { name: platform-api, path: services/platform-api }
+          - { name: member-api, path: services/member-api }
+          - { name: operator-bff, path: bff/operator-bff }
+          - { name: platform-bff, path: bff/platform-bff }
+          - { name: member-bff, path: bff/member-bff }
+          - { name: operator-web, path: web/operator-web }
+          - { name: platform-web, path: web/platform-web }
+          - { name: member-web, path: web/member-web }
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${{ matrix.service.name }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.service.path }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ==================== DEPLOY TO STAGING ====================
+  deploy-staging:
+    needs: [build]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to staging
+        run: |
+          echo "🚀 Deploying to staging environment"
+          # Add staging deployment logic here
+          # Could use kubectl, docker-compose, or other deployment tools
+
+  # ==================== DEPLOY TO PRODUCTION ====================
+  deploy-production:
+    needs: [build]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to production
+        run: |
+          echo "🚀 Deploying to production environment"
+          # Add production deployment logic here
+          # Should include more sophisticated checks and rollback capabilities
+
+  # ==================== NOTIFICATION ====================
+  notify:
+    needs: [deploy-staging, deploy-production]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Notify deployment status
+        run: |
+          if [[ "${{ needs.deploy-staging.result }}" == "success" ]]; then
+            echo "✅ Staging deployment successful"
+          fi
+          if [[ "${{ needs.deploy-production.result }}" == "success" ]]; then
+            echo "✅ Production deployment successful"
+          fi
+          # Add Slack/Teams/Discord notification here
